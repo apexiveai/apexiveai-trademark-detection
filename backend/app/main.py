@@ -42,7 +42,7 @@ CORS_ORIGINS = [
     item.strip()
     for item in os.getenv(
         "CORS_ORIGINS",
-        "http://localhost:5190,http://127.0.0.1:5190",
+        "http://localhost:5190,http://127.0.0.1:5190,https://apexiveai-trademark-detection.onrender.com",
     ).split(",")
     if item.strip()
 ]

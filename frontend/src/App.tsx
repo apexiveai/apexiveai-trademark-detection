@@ -1,4 +1,5 @@
 import {
+  useEffect,
   useRef,
   useState,
   type CSSProperties,
@@ -48,10 +49,15 @@ type ApplicationNumberResult = {
 };
 
 type EvidenceRegion = {
+  side?: "reference" | "comparison";
+  image_index?: number;
   x?: number;
   y?: number;
   width?: number;
   height?: number;
+  image_width?: number;
+  image_height?: number;
+  shape?: string;
   label?: string;
   confidence?: number;
 };
@@ -104,6 +110,79 @@ function getFileIcon(file: File): typeof FileText {
   if (file.type.startsWith("image/")) return FileImage;
   if (file.name.toLowerCase().endsWith(".xlsx")) return FileImage;
   return FileText;
+}
+
+function isPreviewableImage(file: File): boolean {
+  return (
+    file.type.startsWith("image/") ||
+    /\.(png|jpe?g|webp|svg)$/i.test(file.name)
+  );
+}
+
+function getRegionOutline(region?: EvidenceRegion): CSSProperties | undefined {
+  if (!region) return undefined;
+
+  const { x, y, width, height, image_width, image_height } = region;
+  if (
+    typeof x !== "number" ||
+    typeof y !== "number" ||
+    typeof width !== "number" ||
+    typeof height !== "number" ||
+    typeof image_width !== "number" ||
+    typeof image_height !== "number" ||
+    !Number.isFinite(x) ||
+    !Number.isFinite(y) ||
+    !Number.isFinite(width) ||
+    !Number.isFinite(height) ||
+    !Number.isFinite(image_width) ||
+    !Number.isFinite(image_height) ||
+    image_width <= 0 ||
+    image_height <= 0 ||
+    width <= 0 ||
+    height <= 0
+  ) {
+    return undefined;
+  }
+
+  return {
+    left: `${(x / image_width) * 100}%`,
+    top: `${(y / image_height) * 100}%`,
+    width: `${(width / image_width) * 100}%`,
+    height: `${(height / image_height) * 100}%`,
+  };
+}
+
+function EvidencePreview({
+  file,
+  region,
+  label,
+}: {
+  file: File;
+  region?: EvidenceRegion;
+  label: string;
+}) {
+  const [source, setSource] = useState("");
+
+  useEffect(() => {
+    const objectUrl = URL.createObjectURL(file);
+    setSource(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
+
+  const outline = getRegionOutline(region);
+
+  return (
+    <div className="evidence-image-wrap">
+      {source && <img src={source} alt={`${label} uploaded logo`} />}
+      {outline && (
+        <span
+          className="evidence-region-outline"
+          aria-label="Detected logo region"
+          style={outline}
+        />
+      )}
+    </div>
+  );
 }
 
 function ScoreRing({
@@ -708,6 +787,42 @@ export default function App() {
                   </div>
                   <span className="evidence-count">{regions.length}/{evidence?.max_regions ?? 4}</span>
                 </div>
+
+                {fileA && fileB && (
+                  <div className="evidence-previews">
+                    {[
+                      { side: "reference" as const, file: fileA, label: "Reference" },
+                      { side: "comparison" as const, file: fileB, label: "Comparison" },
+                    ].map(({ side, file, label }) => {
+                      const region = regions.find(
+                        (item) => item.side === side && item.image_index === 1,
+                      );
+
+                      return (
+                        <article className="evidence-preview-card" key={side}>
+                          <strong>{label} logo</strong>
+                          {isPreviewableImage(file) ? (
+                            <EvidencePreview
+                              file={file}
+                              region={region}
+                              label={label}
+                            />
+                          ) : (
+                            <div className="evidence-preview-unavailable">
+                              <ImageIcon size={20} />
+                              <span>Image preview is unavailable for this file type.</span>
+                            </div>
+                          )}
+                          <small>
+                            {region
+                              ? `Detected region · x:${region.x} y:${region.y} w:${region.width} h:${region.height}`
+                              : "No region coordinates returned"}
+                          </small>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
 
                 {regions.length > 0 ? (
                   <div className="evidence-list">

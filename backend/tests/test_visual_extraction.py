@@ -175,6 +175,52 @@ class VisualExtractionTests(unittest.TestCase):
                     80,
                 )
 
+    def test_compare_endpoint_returns_original_image_logo_regions(self) -> None:
+        result = asyncio.run(
+            compare_files(
+                file_a=UploadFile(
+                    filename="reference.png",
+                    file=io.BytesIO(self.logo_png),
+                ),
+                file_b=UploadFile(
+                    filename="comparison.png",
+                    file=io.BytesIO(self.logo_png),
+                ),
+            )
+        )
+
+        evidence = result["result"]["visual_evidence"]
+        regions = evidence["regions"]
+
+        self.assertEqual(evidence["status"], "REGIONS_DETECTED")
+        self.assertEqual(
+            evidence["coordinate_space"],
+            "original_extracted_image_pixels",
+        )
+        self.assertEqual(len(regions), 2)
+        self.assertEqual(
+            {region["side"] for region in regions},
+            {"reference", "comparison"},
+        )
+
+        for region in regions:
+            with self.subTest(side=region["side"]):
+                self.assertEqual(region["image_index"], 1)
+                self.assertEqual(region["image_width"], 256)
+                self.assertEqual(region["image_height"], 256)
+                self.assertGreater(region["width"], 0)
+                self.assertGreater(region["height"], 0)
+                self.assertGreaterEqual(region["x"], 0)
+                self.assertGreaterEqual(region["y"], 0)
+                self.assertLessEqual(
+                    region["x"] + region["width"],
+                    region["image_width"],
+                )
+                self.assertLessEqual(
+                    region["y"] + region["height"],
+                    region["image_height"],
+                )
+
     def test_different_logo_shapes_score_lower(self) -> None:
         different_logo = make_logo_png("square")
         different_xlsx = get_images(
