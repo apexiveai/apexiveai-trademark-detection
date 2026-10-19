@@ -2,23 +2,41 @@
 from __future__ import annotations
 
 import difflib
+import hmac
 import io
+import json
 import os
 import re
+import smtplib
+import time
 import zipfile
+from collections import deque
 from pathlib import Path
 from typing import Any
 import cv2
 import numpy as np
 import pymupdf
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field
 from openpyxl import load_workbook
 from PIL import Image, ImageChops, ImageStat, UnidentifiedImageError
 from pypdf import PdfReader
+from starlette.concurrency import run_in_threadpool
+from starlette.middleware.base import RequestResponseEndpoint
+from starlette.requests import Request
 from xml.etree import ElementTree
 
+from app.auth import (
+    auth_is_required,
+    community_access_enabled,
+    login_user,
+    register_user,
+    require_user,
+    verify_email,
+)
 
 APP_NAME = "Apexive AI Trademark Conflict Detector"
 VERSION = "1.1.0"
@@ -32,6 +50,7 @@ MAX_IMAGES_PER_FILE = 100
 MAX_IMAGE_PIXELS = 40_000_000
 MAX_RENDERED_PAGE_DIMENSION = 1600
 MAX_RENDERED_SVG_DIMENSION = 512
+LOGO_MATCH_THRESHOLD = 80
 
 ALLOWED_EXTENSIONS = {
     ".pdf", ".xlsx", ".xlsm", ".txt",
@@ -60,8 +79,62 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["GET", "POST", "OPTIONS"],
-    allow_headers=["Content-Type", "Accept"],
+    allow_headers=["Content-Type", "Accept", "Authorization", "X-Ingest-Key"],
 )
+
+_rate_limit_windows: dict[tuple[str, str], deque[float]] = {}
+_RATE_LIMITS = {
+    "/api/v1/auth/register": (5, 60),
+    "/api/v1/auth/login": (12, 60),
+    "/api/v1/auth/verify": (12, 60),
+    "/api/v1/trademarks/search": (30, 60),
+    "/api/v1/compare": (30, 60),
+    "/api/v1/logo/crop": (30, 60),
+    "/api/v1/trademarks": (20, 60),
+}
+
+
+@app.middleware("http")
+async def apply_rate_limits(
+    request: Request,
+    call_next: RequestResponseEndpoint,
+) -> Response:
+    rule = _RATE_LIMITS.get(request.url.path)
+    if rule is None:
+        return await call_next(request)
+    client_ip = request.client.host if request.client else "unknown"
+    key = (client_ip, request.url.path)
+    limit, window_seconds = rule
+    now = time.monotonic()
+    requests = _rate_limit_windows.setdefault(key, deque())
+    while requests and now - requests[0] >= window_seconds:
+        requests.popleft()
+    if len(requests) >= limit:
+        retry_after = max(1, int(window_seconds - (now - requests[0])))
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Too many requests. Please try again shortly."},
+            headers={"Retry-After": str(retry_after)},
+        )
+    requests.append(now)
+    if len(_rate_limit_windows) > 10_000:
+        expired_keys = [
+            bucket
+            for bucket, timestamps in _rate_limit_windows.items()
+            if not timestamps or now - timestamps[-1] >= window_seconds
+        ]
+        for bucket in expired_keys:
+            _rate_limit_windows.pop(bucket, None)
+    return await call_next(request)
+
+
+class AuthPayload(BaseModel):
+    email: str = Field(max_length=254)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class EmailVerificationPayload(BaseModel):
+    token: str = Field(min_length=1, max_length=256)
 
 
 def clean_text(value: str) -> str:
@@ -214,7 +287,9 @@ def extract_svg_text(data: bytes) -> str:
     return " ".join(parts)[:MAX_TEXT_CHARS]
 
 
-def extract_pdf(data: bytes) -> tuple[str, list[bytes], list[str]]:
+def extract_pdf(
+    data: bytes,
+) -> tuple[str, list[bytes], list[str], list[str]]:
     reader = PdfReader(io.BytesIO(data), strict=False)
 
     if reader.is_encrypted:
@@ -231,6 +306,7 @@ def extract_pdf(data: bytes) -> tuple[str, list[bytes], list[str]]:
     total_pages = len(reader.pages)
     text_parts: list[str] = []
     images: list[bytes] = []
+    image_locations: list[str] = []
     limitations: list[str] = []
 
     if total_pages > MAX_PDF_PAGES:
@@ -249,6 +325,7 @@ def extract_pdf(data: bytes) -> tuple[str, list[bytes], list[str]]:
 
     try:
         for page_index, page in enumerate(reader.pages[:MAX_PDF_PAGES]):
+            embedded_image_index = 0
             try:
                 page_text = page.extract_text() or ""
                 if page_text:
@@ -269,6 +346,11 @@ def extract_pdf(data: bytes) -> tuple[str, list[bytes], list[str]]:
                         try:
                             validate_raster(candidate)
                             images.append(candidate)
+                            embedded_image_index += 1
+                            image_locations.append(
+                                f"Page {page_index + 1} · embedded image "
+                                f"{embedded_image_index}"
+                            )
                         except ValueError:
                             limitations.append(
                                 "An unsupported embedded image was skipped "
@@ -299,6 +381,9 @@ def extract_pdf(data: bytes) -> tuple[str, list[bytes], list[str]]:
                     candidate = pixmap.tobytes("png")
                     validate_raster(candidate)
                     images.append(candidate)
+                    image_locations.append(
+                        f"Page {page_index + 1} · rendered page"
+                    )
                 except Exception:
                     limitations.append(
                         "PDF page "
@@ -315,10 +400,18 @@ def extract_pdf(data: bytes) -> tuple[str, list[bytes], list[str]]:
         if render_document is not None:
             render_document.close()
 
+    if len(images) >= MAX_IMAGES_PER_FILE:
+        limitations.append(
+            f"Visual image extraction reached the {MAX_IMAGES_PER_FILE}-image "
+            "limit; additional page or embedded images may not have been "
+            "compared."
+        )
+
     return (
         "\n".join(text_parts)[:MAX_TEXT_CHARS],
         images,
         limitations,
+        image_locations,
     )
 
 
@@ -351,7 +444,9 @@ def rasterize_svg(data: bytes) -> bytes:
             svg_document.close()
 
 
-def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
+def extract_xlsx(
+    data: bytes,
+) -> tuple[str, list[bytes], list[str], list[str]]:
     if not zipfile.is_zipfile(io.BytesIO(data)):
         raise ValueError("Invalid XLSX/XLSM document.")
 
@@ -368,6 +463,7 @@ def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
 
     text_parts: list[str] = []
     images: list[bytes] = []
+    image_locations: list[str] = []
     limitations: list[str] = []
     cell_count = 0
 
@@ -380,7 +476,10 @@ def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
                 f"first {MAX_WORKSHEETS} were processed."
             )
 
-        for worksheet in worksheets[:MAX_WORKSHEETS]:
+        for worksheet_index, worksheet in enumerate(
+            worksheets[:MAX_WORKSHEETS],
+            start=1,
+        ):
             text_parts.append(f"WORKSHEET: {worksheet.title}")
 
             for row in worksheet.iter_rows(values_only=True):
@@ -396,6 +495,7 @@ def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
                             "\n".join(text_parts)[:MAX_TEXT_CHARS],
                             images,
                             limitations,
+                            image_locations,
                         )
 
                     if value is not None:
@@ -409,13 +509,17 @@ def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
                         "\n".join(text_parts)[:MAX_TEXT_CHARS],
                         images,
                         limitations,
+                        image_locations,
                     )
 
             # openpyxl exposes embedded worksheet images through _images.
             # This is a library implementation detail and should be
             # regression-tested when upgrading openpyxl.
             try:
-                for embedded in getattr(worksheet, "_images", []):
+                for embedded_image_index, embedded in enumerate(
+                    getattr(worksheet, "_images", []),
+                    start=1,
+                ):
                     if len(images) >= MAX_IMAGES_PER_FILE:
                         limitations.append(
                             f"Image extraction stopped at "
@@ -427,6 +531,11 @@ def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
                         candidate = embedded._data()
                         validate_raster(candidate)
                         images.append(candidate)
+                        image_locations.append(
+                            f"Sheet {worksheet_index} · {worksheet.title} · "
+                            "embedded image "
+                            f"{embedded_image_index}"
+                        )
                     except Exception:
                         continue
             except Exception:
@@ -439,6 +548,7 @@ def extract_xlsx(data: bytes) -> tuple[str, list[bytes], list[str]]:
             "\n".join(text_parts)[:MAX_TEXT_CHARS],
             images,
             limitations,
+            image_locations,
         )
 
     finally:
@@ -455,19 +565,22 @@ def analyze_file(filename: str, data: bytes) -> dict[str, Any]:
         "filename": filename,
         "text": "",
         "images": [],
+        "image_locations": [],
         "limitations": [],
     }
 
     if ext == ".pdf":
-        text, images, limitations = extract_pdf(data)
+        text, images, limitations, image_locations = extract_pdf(data)
         result["text"] = text
         result["images"] = images
+        result["image_locations"] = image_locations
         result["limitations"].extend(limitations)
 
     elif ext in {".xlsx", ".xlsm"}:
-        text, images, limitations = extract_xlsx(data)
+        text, images, limitations, image_locations = extract_xlsx(data)
         result["text"] = text
         result["images"] = images
+        result["image_locations"] = image_locations
         result["limitations"].extend(limitations)
 
     elif ext == ".txt":
@@ -476,9 +589,11 @@ def analyze_file(filename: str, data: bytes) -> dict[str, Any]:
     elif ext == ".svg":
         result["text"] = extract_svg_text(data)
         result["images"] = [rasterize_svg(data)]
+        result["image_locations"] = ["Image 1"]
 
     else:
         result["images"] = [validate_raster(data)]
+        result["image_locations"] = ["Image 1"]
 
     result["application_numbers"] = extract_application_numbers(
         result["text"]
@@ -582,12 +697,12 @@ def score_prepared_images(image_a: Image.Image, image_b: Image.Image) -> float:
         else pixel_score
     )
 
-    return round(
+    return float(round(
         0.20 * pixel_score
         + 0.15 * histogram_score
         + 0.65 * silhouette_score,
         2,
-    )
+    ))
 
 
 def compare_images(
@@ -621,10 +736,17 @@ def compare_image_collections(
                 continue
 
     best_match: dict[str, Any] | None = None
+    similar_matches: list[dict[str, Any]] = []
 
     for index_a, image_a in prepared_a:
         for index_b, image_b in prepared_b:
             score = score_prepared_images(image_a, image_b)
+            if score >= LOGO_MATCH_THRESHOLD:
+                similar_matches.append({
+                    "reference_image_index": index_a + 1,
+                    "comparison_image_index": index_b + 1,
+                    "similarity": score,
+                })
 
             if best_match is None or score > best_match["similarity"]:
                 best_match = {
@@ -633,6 +755,15 @@ def compare_image_collections(
                     "similarity": score,
                 }
 
+    if best_match is not None:
+        best_match["matches"] = sorted(
+            similar_matches,
+            key=lambda match: (
+                -match["similarity"],
+                match["reference_image_index"],
+                match["comparison_image_index"],
+            ),
+        )
     return best_match
 
 def detect_logo_region(source: bytes) -> dict[str, Any] | None:
@@ -866,18 +997,68 @@ def root() -> dict[str, str]:
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "trademark-comparison-api",
         "version": VERSION,
+        "auth_required": auth_is_required(),
+        "community_access_managed": community_access_enabled(),
+        "community_solution_code": os.getenv("COMMUNITY_SOLUTION_CODE", "trademark-conflict-detector"),
     }
+
+
+@app.get("/api/v1/auth/config")
+def auth_config() -> dict[str, Any]:
+    return {
+        "required": auth_is_required(),
+        "verification": "email",
+        "community_access_managed": community_access_enabled(),
+        "community_solution_code": os.getenv("COMMUNITY_SOLUTION_CODE", "trademark-conflict-detector"),
+    }
+
+
+@app.post("/api/v1/auth/register")
+def register(payload: AuthPayload) -> dict[str, str]:
+    try:
+        register_user(payload.email, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (OSError, smtplib.SMTPException) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Verification email could not be sent. Check SMTP configuration and try again.",
+        ) from exc
+    return {"status": "verification_sent"}
+
+
+@app.post("/api/v1/auth/verify")
+def verify(payload: EmailVerificationPayload) -> dict[str, str]:
+    try:
+        email = verify_email(payload.token)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"status": "verified", "email": email}
+
+
+@app.post("/api/v1/auth/login")
+def login(payload: AuthPayload) -> dict[str, str]:
+    try:
+        token = login_user(payload.email, payload.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"access_token": token, "token_type": "bearer"}
 
 
 @app.post("/api/v1/compare")
 async def compare_files(
     file_a: UploadFile = File(...),
     file_b: UploadFile = File(...),
+    _user: str | None = Depends(require_user),
 ) -> dict[str, Any]:
     data_a = await read_upload(file_a)
     data_b = await read_upload(file_b)
@@ -911,6 +1092,25 @@ async def compare_files(
         analyzed_b["images"],
         image_match,
     )
+    logo_matches = image_match["matches"] if image_match is not None else []
+    visual_match_summary = (
+        {
+            key: value
+            for key, value in image_match.items()
+            if key != "matches"
+        }
+        if image_match is not None
+        else None
+    )
+    for match in logo_matches:
+        reference_index = match["reference_image_index"] - 1
+        comparison_index = match["comparison_image_index"] - 1
+        match["reference_location"] = analyzed_a["image_locations"][
+            reference_index
+        ]
+        match["comparison_location"] = analyzed_b["image_locations"][
+            comparison_index
+        ]
 
     if visual_evidence["status"] == "NO_REGIONS_DETECTED":
         limitations.append(
@@ -999,7 +1199,9 @@ async def compare_files(
                 "reference_numbers": sorted(numbers_a),
                 "comparison_numbers": sorted(numbers_b),
             },
-            "visual_match": image_match,
+            "visual_match": visual_match_summary,
+            "logo_matches": logo_matches,
+            "logo_match_threshold": LOGO_MATCH_THRESHOLD,
             "visual_evidence": visual_evidence,
             "limitations": list(dict.fromkeys(limitations)),
         },
@@ -1015,4 +1217,153 @@ async def compare_files(
                 "extracted_image_count": len(analyzed_b["images"]),
             },
         ],
+    }
+
+
+def _require_image_upload(filename: str) -> None:
+    if Path(filename).suffix.lower() not in {
+        ".png", ".jpg", ".jpeg", ".webp", ".svg",
+    }:
+        raise HTTPException(
+            status_code=415,
+            detail="Upload a PNG, JPG, WEBP, or SVG logo image.",
+        )
+
+
+@app.post("/api/v1/logo/crop")
+async def crop_logo(
+    file: UploadFile = File(...),
+    _user: str | None = Depends(require_user),
+) -> Response:
+    from app.logo_search import extract_logo_crop
+
+    filename = Path(file.filename or "").name
+    _require_image_upload(filename)
+    data = await read_upload(file)
+    try:
+        analyzed = analyze_file(filename, data)
+        if not analyzed["images"]:
+            raise ValueError("No image could be extracted from the upload.")
+        original = analyzed["images"][0]
+        region = detect_logo_region(original)
+        cropped = extract_logo_crop(original)
+        if cropped is None:
+            raise ValueError("No logo region was detected in the uploaded image.")
+        output = io.BytesIO()
+        cropped.save(output, format="PNG", optimize=True)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return Response(
+        content=output.getvalue(),
+        media_type="image/png",
+        headers={
+            "X-Logo-Region": json.dumps(region or {}),
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.post("/api/v1/trademarks")
+async def add_trademark(
+    image: UploadFile = File(...),
+    jurisdiction: str = Form(...),
+    mark_name: str = Form(...),
+    trademark_number: str = Form(""),
+    classes: str = Form(""),
+    goods_services: str = Form(""),
+    source_url: str = Form(""),
+    x_ingest_key: str | None = Header(default=None),
+    _user: str | None = Depends(require_user),
+) -> dict[str, Any]:
+    from app.logo_search import index_trademark
+
+    configured_key = os.getenv("TRADEMARK_INGEST_KEY")
+    if not configured_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Trademark ingestion is disabled until TRADEMARK_INGEST_KEY is configured.",
+        )
+    if not x_ingest_key or not hmac.compare_digest(x_ingest_key, configured_key):
+        raise HTTPException(status_code=401, detail="Invalid ingestion credentials.")
+
+    filename = Path(image.filename or "").name
+    _require_image_upload(filename)
+    data = await read_upload(image)
+    try:
+        analyzed = analyze_file(filename, data)
+        if not analyzed["images"]:
+            raise ValueError("No image could be extracted from the upload.")
+        record = await run_in_threadpool(
+            index_trademark,
+            image_data=analyzed["images"][0],
+            jurisdiction=jurisdiction,
+            mark_name=mark_name,
+            trademark_number=trademark_number,
+            classes=classes,
+            goods_services=goods_services,
+            source_url=source_url,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"trademark": record}
+
+
+@app.post("/api/v1/trademarks/search")
+async def search_trademark_index(
+    image: UploadFile = File(...),
+    mark_name: str = Form(""),
+    goods_services: str = Form(""),
+    classes: str = Form(""),
+    jurisdictions: list[str] = Form(default=[]),
+    limit: int = Form(10),
+    _user: str | None = Depends(require_user),
+) -> dict[str, Any]:
+    from app.logo_search import search_trademarks
+
+    filename = Path(image.filename or "").name
+    _require_image_upload(filename)
+    data = await read_upload(image)
+    try:
+        analyzed = analyze_file(filename, data)
+        if not analyzed["images"]:
+            raise ValueError("No image could be extracted from the upload.")
+        return await run_in_threadpool(
+            search_trademarks,
+            image_data=analyzed["images"][0],
+            mark_name=mark_name,
+            goods_services=goods_services,
+            classes=classes,
+            jurisdictions=jurisdictions,
+            limit=limit,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+
+@app.get("/api/v1/trademarks/{trademark_id}/logo")
+def trademark_logo(
+    trademark_id: str,
+    _user: str | None = Depends(require_user),
+) -> Response:
+    from app.logo_search import get_logo
+
+    image = get_logo(trademark_id)
+    if image is None:
+        raise HTTPException(status_code=404, detail="Trademark logo not found.")
+    return Response(image, media_type="image/png", headers={"Cache-Control": "public, max-age=3600"})
+
+
+@app.get("/api/v1/trademarks/status")
+def trademark_index_status() -> dict[str, Any]:
+    from app.logo_search import get_index_count
+
+    count = get_index_count()
+    return {
+        "indexed_trademarks": count,
+        "jurisdictions": ["MYANMAR", "WIPO", "EUIPO", "TMVIEW", "USPTO"],
+        "data_policy": "Only imported records are searchable; registry data is not fetched automatically.",
     }

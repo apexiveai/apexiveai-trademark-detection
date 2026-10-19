@@ -1,0 +1,10 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+backend/.venv/
+backend/data/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo

@@ -22,6 +22,7 @@ import {
   Image as ImageIcon,
   LoaderCircle,
   ScanSearch,
+  Search,
   ShieldCheck,
   Sparkles,
   UploadCloud,
@@ -32,6 +33,7 @@ import "./styles.css";
 
 const API_URL =
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8017";
+const LOGO_MATCHES_PER_PAGE = 100;
 
 type UploadSide = "a" | "b";
 type UploadSlot = UploadSide;
@@ -75,6 +77,8 @@ type ComparisonResult = {
     comparison_image_index?: number;
     similarity?: number;
   } | null;
+  logo_matches?: LogoMatch[];
+  logo_match_threshold?: number;
   visual_evidence?: {
     regions?: EvidenceRegion[];
     max_regions?: number;
@@ -83,9 +87,47 @@ type ComparisonResult = {
   limitations?: string[];
 };
 
+type LogoMatch = {
+  reference_image_index: number;
+  comparison_image_index: number;
+  reference_location: string;
+  comparison_location: string;
+  similarity: number;
+};
+
 type ApiResponse = {
   result: ComparisonResult;
   files?: FileInfo[];
+};
+
+type TrademarkMatch = {
+  id: string;
+  jurisdiction: string;
+  mark_name: string;
+  trademark_number: string;
+  classes: string[];
+  goods_services: string;
+  source_url: string;
+  logo_url: string;
+  similarity: number;
+  risk_level: string;
+  signals: {
+    embedding: number;
+    shape: number;
+    color: number;
+    layout: number;
+    text: number | null;
+    class: number | null;
+    visual: number;
+  };
+  evidence_region?: EvidenceRegion | null;
+};
+
+type TrademarkSearchResponse = {
+  matches: TrademarkMatch[];
+  scanned_candidates: number;
+  query_evidence_region?: EvidenceRegion | null;
+  coverage_note: string;
 };
 
 function formatBytes(bytes: number): string {
@@ -182,6 +224,74 @@ function EvidencePreview({
         />
       )}
     </div>
+  );
+}
+
+function RemoteEvidencePreview({
+  source,
+  region,
+  label,
+  token,
+}: {
+  source: string;
+  region?: EvidenceRegion | null;
+  label: string;
+  token: string;
+}) {
+  const [imageUrl, setImageUrl] = useState("");
+  const [loadError, setLoadError] = useState("");
+
+  useEffect(() => {
+    let objectUrl = "";
+    let cancelled = false;
+    setImageUrl("");
+    setLoadError("");
+    void fetch(source, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error(`Logo preview request failed (${response.status}).`);
+        }
+        return response.blob();
+      })
+      .then((image) => {
+        objectUrl = URL.createObjectURL(image);
+        if (cancelled) URL.revokeObjectURL(objectUrl);
+        else setImageUrl(objectUrl);
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setLoadError(
+            error instanceof Error ? error.message : "Logo preview could not be loaded.",
+          );
+        }
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [source, token]);
+
+  const outline = getRegionOutline(region ?? undefined);
+  return (
+    imageUrl ? (
+      <div className="evidence-image-wrap">
+        <img src={imageUrl} alt={`${label} trademark logo`} />
+        {outline && (
+          <span
+            className="evidence-region-outline"
+            aria-label="Detected logo region"
+            style={outline}
+          />
+        )}
+      </div>
+    ) : (
+      <div className="evidence-preview-unavailable">
+        <ImageIcon size={20} />
+        <span>{loadError || "Loading trademark logo..."}</span>
+      </div>
+    )
   );
 }
 
@@ -327,17 +437,174 @@ export default function App() {
   const [fileB, setFileB] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<ApiResponse | null>(null);
+  const [logoMatchPage, setLogoMatchPage] = useState(1);
   const [error, setError] = useState("");
   const [apiOnline, setApiOnline] = useState<boolean | null>(null);
+  const [searchLogo, setSearchLogo] = useState<File | null>(null);
+  const [searchMarkName, setSearchMarkName] = useState("");
+  const [searchGoods, setSearchGoods] = useState("");
+  const [searchClasses, setSearchClasses] = useState("");
+  const [searchJurisdictions, setSearchJurisdictions] = useState<string[]>([]);
+  const [searchLoading, setSearchLoading] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [searchResults, setSearchResults] = useState<TrademarkSearchResponse | null>(null);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authToken, setAuthToken] = useState(() => sessionStorage.getItem("apexive-session") || "");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authMode, setAuthMode] = useState<"login" | "register">("login");
+  const [authLoading, setAuthLoading] = useState(false);
+  const [authMessage, setAuthMessage] = useState("");
 
-  const canCompare = Boolean(fileA && fileB && !loading);
+  const communityManagedAccess = Boolean(
+    import.meta.env.VITE_COMMUNITY_API_URL &&
+      import.meta.env.VITE_COMMUNITY_SOLUTION_CODE,
+  );
+  const canUseWorkspace = !authRequired || Boolean(authToken);
+  const canCompare = Boolean(fileA && fileB && !loading && canUseWorkspace);
+  const canSearch = Boolean(searchLogo && !searchLoading && canUseWorkspace);
+  const jurisdictions = ["MYANMAR", "WIPO", "EUIPO", "TMVIEW", "USPTO"];
+  const productHighlights = [
+    {
+      icon: ShieldCheck,
+      title: "Tenant-first security",
+      description: "Controlled access, role-aware accounts, and production-ready deployment hardening for client workspaces.",
+    },
+    {
+      icon: ScanSearch,
+      title: "Visual + text screening",
+      description: "Compare documents, spreadsheets, and logo images using extracted layout and similarity evidence.",
+    },
+    {
+      icon: Gauge,
+      title: "Actionable outputs",
+      description: "Get similarity scores, visual evidence circles, and per-page or per-sheet match references.",
+    },
+    {
+      icon: Sparkles,
+      title: "Commercial readiness",
+      description: "Built for law firms, brand teams, and managed community tenants that need a polished client-facing product.",
+    },
+  ];
+  const pricingPlans = [
+    {
+      name: "Community",
+      price: "$0",
+      period: "/ month",
+      description: "For individual reviewers and early pilots.",
+      features: ["1 tenant workspace", "5 comparisons / month", "Basic exports"],
+      featured: false,
+    },
+    {
+      name: "Growth",
+      price: "$49",
+      period: "/ month",
+      description: "For active teams screening trademarks weekly.",
+      features: ["Unlimited comparisons", "Priority screening queue", "PDF export", "Audit log"],
+      featured: true,
+    },
+    {
+      name: "Enterprise",
+      price: "$199",
+      period: "/ month",
+      description: "For firms with managed tenant teams and legal review workflows.",
+      features: ["Unlimited tenants", "SSO and policy controls", "Custom reports", "Dedicated onboarding"],
+      featured: false,
+    },
+  ];
+  const legalNotes = [
+    "This platform provides preliminary screening signals only, not legal advice.",
+    "Every result should be reviewed by a qualified trademark professional before action.",
+    "Customer data is retained according to the tenant policy and export retention controls.",
+  ];
 
   const checkApi = async () => {
     try {
       const response = await fetch(`${API_URL}/health`);
       setApiOnline(response.ok);
+      if (response.ok) {
+        const status = await response.json();
+        setAuthRequired(status.auth_required === true);
+      }
     } catch {
       setApiOnline(false);
+    }
+  };
+
+  useEffect(() => {
+    void checkApi();
+    const verificationToken = new URLSearchParams(window.location.search).get("verify");
+    if (!verificationToken) return;
+    void fetch(`${API_URL}/api/v1/auth/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ token: verificationToken }),
+    })
+      .then(async (response) => {
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(typeof payload.detail === "string" ? payload.detail : "Email verification failed.");
+        }
+        setAuthEmail(payload.email || "");
+        setAuthMessage("Email verified. Sign in to continue.");
+        setAuthMode("login");
+      })
+      .catch((err: unknown) => {
+        setAuthMessage(
+          err instanceof Error ? err.message : "Email verification failed.",
+        );
+      })
+      .finally(() => {
+        const url = new URL(window.location.href);
+        url.searchParams.delete("verify");
+        window.history.replaceState({}, "", url);
+      });
+  }, []);
+
+  const submitAuth = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setAuthLoading(true);
+    setAuthMessage("");
+    try {
+      const response = await fetch(`${API_URL}/api/v1/auth/${authMode === "register" ? "register" : "login"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(typeof payload.detail === "string" ? payload.detail : "Account request failed.");
+      }
+      if (authMode === "register") {
+        setAuthMessage("Verification email sent. Open its link to activate your account.");
+        setAuthMode("login");
+        setAuthPassword("");
+      } else {
+        const token = payload.access_token;
+        if (typeof token !== "string" || !token) {
+          throw new Error("Sign-in response did not contain an access token.");
+        }
+        sessionStorage.setItem("apexive-session", token);
+        setAuthToken(token);
+        setAuthPassword("");
+        setAuthMessage("Signed in successfully.");
+      }
+    } catch (err) {
+      setAuthMessage(err instanceof Error ? err.message : "Account request failed.");
+    } finally {
+      setAuthLoading(false);
+    }
+  };
+
+  const signOut = () => {
+    sessionStorage.removeItem("apexive-session");
+    setAuthToken("");
+    setAuthMessage("Signed out.");
+  };
+
+  const exportReport = () => {
+    if (typeof window !== "undefined") {
+      window.print();
     }
   };
 
@@ -350,6 +617,7 @@ export default function App() {
     setLoading(true);
     setError("");
     setResult(null);
+    setLogoMatchPage(1);
 
     try {
       const formData = new FormData();
@@ -358,6 +626,7 @@ export default function App() {
 
       const response = await fetch(`${API_URL}/api/v1/compare`, {
         method: "POST",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
         body: formData,
       });
 
@@ -395,6 +664,57 @@ export default function App() {
     }
   };
 
+  const searchTrademarks = async () => {
+    if (!searchLogo) {
+      setSearchError("Upload a logo image to search the trademark index.");
+      return;
+    }
+
+    setSearchLoading(true);
+    setSearchError("");
+    setSearchResults(null);
+    try {
+      const formData = new FormData();
+      formData.append("image", searchLogo);
+      formData.append("mark_name", searchMarkName);
+      formData.append("goods_services", searchGoods);
+      formData.append("classes", searchClasses);
+      formData.append("limit", "10");
+      searchJurisdictions.forEach((jurisdiction) => {
+        formData.append("jurisdictions", jurisdiction);
+      });
+      const response = await fetch(`${API_URL}/api/v1/trademarks/search`, {
+        method: "POST",
+        headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+        body: formData,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(
+          typeof payload.detail === "string"
+            ? payload.detail
+            : "Trademark search failed.",
+        );
+      }
+      setSearchResults(payload as TrademarkSearchResponse);
+      setApiOnline(true);
+      window.setTimeout(() => {
+        document
+          .getElementById("trademark-search-results")
+          ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      }, 100);
+    } catch (err) {
+      setSearchError(
+        err instanceof Error
+          ? `${err.message}. Check that the local embedding model and vector index are configured.`
+          : "Trademark search could not be completed.",
+      );
+      setApiOnline(false);
+    } finally {
+      setSearchLoading(false);
+    }
+  };
+
   const currentResult = result?.result;
   const overall = safeScore(currentResult?.overall_similarity);
   const visual = safeScore(currentResult?.visual_similarity);
@@ -403,6 +723,15 @@ export default function App() {
   const evidence = currentResult?.visual_evidence;
   const regions = evidence?.regions ?? [];
   const files = result?.files ?? [];
+  const logoMatches = currentResult?.logo_matches ?? [];
+  const logoMatchPageCount = Math.max(
+    1,
+    Math.ceil(logoMatches.length / LOGO_MATCHES_PER_PAGE),
+  );
+  const visibleLogoMatches = logoMatches.slice(
+    (logoMatchPage - 1) * LOGO_MATCHES_PER_PAGE,
+    logoMatchPage * LOGO_MATCHES_PER_PAGE,
+  );
 
   return (
     <main className="app-shell">
@@ -427,14 +756,17 @@ export default function App() {
           </a>
 
           <nav className="top-nav" aria-label="Main navigation">
-            <a className="nav-link nav-link-active" href="#workspace">
+            <a className="nav-link nav-link-active" href="#community">
+              Community
+            </a>
+            <a className="nav-link" href="#workspace">
               Workspace
             </a>
-            <a className="nav-link" href="#analysis-results">
-              Analysis
+            <a className="nav-link" href="#pricing">
+              Pricing
             </a>
-            <a className="nav-link" href="#system-status">
-              System
+            <a className="nav-link" href="#legal">
+              Legal
             </a>
           </nav>
 
@@ -453,6 +785,124 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        <section className="community-hero" id="community">
+          <div className="community-copy">
+            <div className="eyebrow">
+              <span className="eyebrow-line" />
+              APEXIVEAI COMMUNITY / TENANT ACCESS
+            </div>
+            <h1>Trusted trademark clearance for modern brand teams.</h1>
+            <p className="hero-description">
+              ApexiveAI Community brings tenant-aware comparison workflows,
+              subscription-ready delivery, and polished report output for teams
+              screening marks, logos, and document submissions with confidence.
+            </p>
+            <div className="community-actions">
+              <a className="hero-cta" href="#workspace">
+                <span>Open workspace</span>
+                <ArrowUpRight size={16} />
+              </a>
+              <a className="secondary-cta" href="#pricing">
+                View subscriptions
+              </a>
+            </div>
+            <div className="hero-proof">
+              <div className="proof-icon"><ShieldCheck size={16} /></div>
+              <span>COMMUNITY TENANTS</span>
+              <i />
+              <span>LEGAL SCREENING</span>
+              <i />
+              <span>REPORT EXPORT</span>
+            </div>
+          </div>
+
+          <div className="community-panel">
+            <div className="tenant-card">
+              <div className="tenant-row">
+                <span>Tenant</span>
+                <strong>ApexiveAI Community</strong>
+              </div>
+              <div className="tenant-row">
+                <span>Plan</span>
+                <strong>Growth</strong>
+              </div>
+              <div className="tenant-row">
+                <span>Seats</span>
+                <strong>8 active reviewers</strong>
+              </div>
+              <div className="tenant-row">
+                <span>Storage</span>
+                <strong>12.4 GB retained</strong>
+              </div>
+              <div className="tenant-plan-grid">
+                <span className="plan-pill active">Starter</span>
+                <span className="plan-pill">Growth</span>
+                <span className="plan-pill">Enterprise</span>
+              </div>
+              <button type="button" className="tenant-button compare-button">
+                <ShieldCheck size={15} /> Manage subscriptions
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section className="feature-grid" aria-label="Product advantages">
+          {productHighlights.map(({ icon: Icon, title, description }) => (
+            <article key={title} className="feature-card">
+              <div className="feature-icon"><Icon size={18} /></div>
+              <h3>{title}</h3>
+              <p>{description}</p>
+            </article>
+          ))}
+        </section>
+
+        <section className="pricing-panel" id="pricing">
+          <div className="section-heading section-heading-compact">
+            <div>
+              <div className="section-kicker"><span>00</span> / SUBSCRIPTIONS</div>
+              <h2>Pricing <span>for teams</span></h2>
+            </div>
+            <div className="result-badge"><CheckCircle2 size={15} /> TENANT READY</div>
+          </div>
+          <div className="pricing-grid">
+            {pricingPlans.map(({ name, price, period, description, features, featured }) => (
+              <article key={name} className={`pricing-card ${featured ? "featured" : ""}`}>
+                <div className="pricing-header">
+                  <span>{name}</span>
+                  <strong>{price}<small>{period}</small></strong>
+                </div>
+                <p>{description}</p>
+                <ul>
+                  {features.map((feature) => (
+                    <li key={feature}>{feature}</li>
+                  ))}
+                </ul>
+                <button type="button" className="secondary-cta pricing-button">
+                  {featured ? "Choose Growth" : "Select plan"}
+                </button>
+              </article>
+            ))}
+          </div>
+        </section>
+
+        <section className="community-legal" id="legal">
+          <div className="section-heading section-heading-compact">
+            <div>
+              <div className="section-kicker"><span>00</span> / LEGAL + COMPLIANCE</div>
+              <h2>Business <span>guardrails</span></h2>
+            </div>
+            <div className="result-badge"><ShieldCheck size={15} /> PRELIMINARY ONLY</div>
+          </div>
+          <div className="legal-note-grid">
+            {legalNotes.map((note) => (
+              <div key={note} className="legal-note-card">
+                <ShieldCheck size={16} />
+                <span>{note}</span>
+              </div>
+            ))}
+          </div>
+        </section>
 
         <section className="hero">
           <div className="hero-main">
@@ -552,13 +1002,85 @@ export default function App() {
             <div>
               <div className="section-kicker"><span>01</span> / INPUT STATION</div>
               <h2>Comparison <span>workspace</span></h2>
-              <p>Choose two files to initiate trademark screening.</p>
+              <p>Compare two marks, or search the imported trademark vector index.</p>
             </div>
             <div className="section-status">
               <span className="status-ring"><span /></span>
               READY TO ANALYZE
             </div>
           </div>
+
+          {(authRequired || communityManagedAccess) && (
+            <div className="auth-panel">
+              <div className="auth-panel-heading">
+                <div>
+                  <span className="card-overline">COMMUNITY ACCESS</span>
+                  <h3>
+                    {communityManagedAccess
+                      ? "Tenant access is managed by ApexiveAI Community"
+                      : authToken
+                        ? "Verified account session"
+                        : "Email account required"}
+                  </h3>
+                </div>
+                {!communityManagedAccess && (authToken ? (
+                  <button className="auth-action-button" type="button" onClick={signOut}>SIGN OUT</button>
+                ) : (
+                  <div className="auth-mode-switch">
+                    <button
+                      className={authMode === "login" ? "active" : ""}
+                      type="button"
+                      onClick={() => { setAuthMode("login"); setAuthMessage(""); }}
+                    >SIGN IN</button>
+                    <button
+                      className={authMode === "register" ? "active" : ""}
+                      type="button"
+                      onClick={() => { setAuthMode("register"); setAuthMessage(""); }}
+                    >CREATE ACCOUNT</button>
+                  </div>
+                ))}
+              </div>
+              {communityManagedAccess ? (
+                <p className="auth-session-copy">
+                  Access to this product is controlled by the ApexiveAI Community tenant dashboard. A SuperAdmin must grant the tenant subscription before this workspace can be opened.
+                </p>
+              ) : authToken ? (
+                <p className="auth-session-copy">{authEmail || "Your verified session is active."}</p>
+              ) : (
+                <form className="auth-form" onSubmit={submitAuth}>
+                  <label>
+                    EMAIL
+                    <input
+                      type="email"
+                      autoComplete="email"
+                      required
+                      value={authEmail}
+                      onChange={(event) => setAuthEmail(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    PASSWORD
+                    <input
+                      type="password"
+                      autoComplete={authMode === "register" ? "new-password" : "current-password"}
+                      minLength={authMode === "register" ? 12 : undefined}
+                      maxLength={128}
+                      required
+                      value={authPassword}
+                      onChange={(event) => setAuthPassword(event.target.value)}
+                    />
+                  </label>
+                  <button className="auth-action-button" type="submit" disabled={authLoading}>
+                    {authLoading ? "PLEASE WAIT..." : authMode === "register" ? "SEND VERIFICATION" : "SIGN IN"}
+                  </button>
+                </form>
+              )}
+              {authMessage && <p className="auth-message" role="status">{authMessage}</p>}
+              {!canUseWorkspace && !communityManagedAccess && (
+                <p className="auth-session-copy">Verify your email and sign in before submitting a logo or document.</p>
+              )}
+            </div>
+          )}
 
           <div className="upload-grid">
             <UploadCard
@@ -623,7 +1145,182 @@ export default function App() {
               <span>{error}</span>
             </div>
           )}
+
+          <div className="database-search">
+            <div className="database-search-heading">
+              <div>
+                <span className="card-overline">TRADEMARK DB / TOP 10 SEARCH</span>
+                <h3>Search by logo embedding</h3>
+                <p>Find the closest marks in your imported registry records.</p>
+              </div>
+              <div className="small-icon violet-small"><Search size={18} /></div>
+            </div>
+
+            <div className="search-fields">
+              <label className="search-logo-input">
+                <span>LOGO IMAGE</span>
+                <input
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                  onChange={(event) => {
+                    setSearchLogo(event.target.files?.[0] ?? null);
+                    setSearchResults(null);
+                  }}
+                />
+                {searchLogo && <small>{searchLogo.name} · {formatBytes(searchLogo.size)}</small>}
+              </label>
+              <label>
+                <span>MARK NAME (OPTIONAL)</span>
+                <input
+                  value={searchMarkName}
+                  onChange={(event) => setSearchMarkName(event.target.value)}
+                  maxLength={300}
+                  placeholder="e.g. SILIER"
+                />
+              </label>
+              <label>
+                <span>NICE CLASS(ES)</span>
+                <input
+                  value={searchClasses}
+                  onChange={(event) => setSearchClasses(event.target.value)}
+                  placeholder="e.g. 9, 25"
+                />
+              </label>
+              <label className="search-goods">
+                <span>GOODS &amp; SERVICES (OPTIONAL)</span>
+                <input
+                  value={searchGoods}
+                  onChange={(event) => setSearchGoods(event.target.value)}
+                  maxLength={4000}
+                  placeholder="Describe the relevant products or services"
+                />
+              </label>
+            </div>
+
+            <div className="jurisdiction-filters" aria-label="Trademark jurisdictions">
+              <span>SEARCH CORPUS</span>
+              {jurisdictions.map((jurisdiction) => (
+                <label key={jurisdiction}>
+                  <input
+                    type="checkbox"
+                    checked={searchJurisdictions.includes(jurisdiction)}
+                    onChange={(event) => setSearchJurisdictions((current) =>
+                      event.target.checked
+                        ? [...current, jurisdiction]
+                        : current.filter((item) => item !== jurisdiction),
+                    )}
+                  />
+                  {jurisdiction}
+                </label>
+              ))}
+            </div>
+
+            <div className="workspace-actions">
+              <div className="upload-guidance">
+                <ShieldCheck size={16} />
+                <span>Only trademarks already imported into the vector database are searched.</span>
+              </div>
+              <button
+                className="compare-button"
+                type="button"
+                disabled={!canSearch}
+                onClick={searchTrademarks}
+              >
+                {searchLoading ? (
+                  <><LoaderCircle size={18} className="spin" /> SEARCHING INDEX...</>
+                ) : (
+                  <><Search size={17} /> FIND TOP 10 <ArrowUpRight size={17} /></>
+                )}
+              </button>
+            </div>
+            {searchError && <div className="error-message" role="alert"><X size={17} /><span>{searchError}</span></div>}
+          </div>
         </section>
+
+        {searchResults && (
+          <section className="database-results" id="trademark-search-results">
+            <div className="section-heading">
+              <div>
+                <div className="section-kicker"><span>02</span> / VECTOR SEARCH</div>
+                <h2>Top <span>matches</span></h2>
+                <p>
+                  {searchResults.matches.length} matches from {searchResults.scanned_candidates} vector candidates
+                  · local CLIP embedding.
+                </p>
+              </div>
+              <div className="result-badge"><CheckCircle2 size={15} /> TOP 10 SEARCH</div>
+            </div>
+
+            {searchResults.matches.length ? (
+              <div className="trademark-match-list">
+                {searchResults.matches.map((match, index) => (
+                  <article className="trademark-match-card" key={match.id}>
+                    <div className="trademark-match-heading">
+                      <span className="match-rank">#{String(index + 1).padStart(2, "0")}</span>
+                      <div className="match-title">
+                        <h3>{match.mark_name}</h3>
+                        <p>{match.jurisdiction} · {match.trademark_number || "No number supplied"}</p>
+                      </div>
+                      <span className={`risk-badge ${getRiskClass(match.risk_level)}`}>
+                        <span /> {match.risk_level} RISK
+                      </span>
+                      <strong className="match-score">{match.similarity.toFixed(1)}%</strong>
+                    </div>
+
+                    <div className="match-side-by-side">
+                      <div className="match-logo-panel">
+                        <span>QUERY LOGO · DETECTED REGION</span>
+                        {searchLogo && (
+                          <EvidencePreview
+                            file={searchLogo}
+                            region={searchResults.query_evidence_region ?? undefined}
+                            label="Search query"
+                          />
+                        )}
+                      </div>
+                      <div className="match-arrow"><ArrowLeftRight size={17} /></div>
+                      <div className="match-logo-panel">
+                        <span>REGISTERED MARK · EVIDENCE CIRCLE</span>
+                        <RemoteEvidencePreview
+                          source={`${API_URL}${match.logo_url}`}
+                          region={match.evidence_region}
+                          label={match.mark_name}
+                          token={authToken}
+                        />
+                      </div>
+                    </div>
+
+                    <div className="match-metadata">
+                      <div><span>NICE CLASS</span><strong>{match.classes.length ? match.classes.join(", ") : "Not supplied"}</strong></div>
+                      <div className="match-goods"><span>GOODS &amp; SERVICES</span><strong>{match.goods_services || "Not supplied"}</strong></div>
+                      {match.source_url && (
+                        <a href={match.source_url} target="_blank" rel="noreferrer">
+                          OPEN SOURCE RECORD <ArrowUpRight size={13} />
+                        </a>
+                      )}
+                    </div>
+
+                    <div className="match-signals">
+                      <span>AI LOGO {match.signals.embedding.toFixed(0)}%</span>
+                      <span>SHAPE {match.signals.shape.toFixed(0)}%</span>
+                      <span>COLOR {match.signals.color.toFixed(0)}%</span>
+                      <span>LAYOUT {match.signals.layout.toFixed(0)}%</span>
+                      {match.signals.text !== null && <span>TEXT {match.signals.text.toFixed(0)}%</span>}
+                      {match.signals.class !== null && <span>CLASS {match.signals.class.toFixed(0)}%</span>}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            ) : (
+              <div className="evidence-empty">
+                <div className="evidence-empty-icon"><ScanSearch size={24} /></div>
+                <strong>No indexed trademarks matched these filters</strong>
+                <p>Import licensed registry records for Myanmar, WIPO, EUIPO/TMview, or USPTO, then search again.</p>
+              </div>
+            )}
+            <p className="coverage-note">{searchResults.coverage_note}</p>
+          </section>
+        )}
 
         {loading && (
           <section className="processing-panel" aria-live="polite">
@@ -644,13 +1341,18 @@ export default function App() {
           <section className="results-section" id="analysis-results">
             <div className="section-heading">
               <div>
-                <div className="section-kicker"><span>02</span> / ANALYSIS OUTPUT</div>
+                <div className="section-kicker"><span>03</span> / ANALYSIS OUTPUT</div>
                 <h2>Intelligence <span>report</span></h2>
                 <p>Scores returned by the current backend comparison engine.</p>
               </div>
-              <div className="result-badge">
-                <CheckCircle2 size={15} />
-                ANALYSIS RECEIVED
+              <div className="result-actions">
+                <button className="export-report-button" type="button" onClick={exportReport}>
+                  <FileText size={15} /> EXPORT REPORT
+                </button>
+                <div className="result-badge">
+                  <CheckCircle2 size={15} />
+                  ANALYSIS RECEIVED
+                </div>
               </div>
             </div>
 
@@ -730,6 +1432,88 @@ export default function App() {
                   </div>
                 </div>
               </div>
+            </div>
+
+            <div className="result-panel logo-matches-panel">
+              <div className="panel-heading">
+                <div className="panel-heading-icon"><ScanSearch size={17} /></div>
+                <div>
+                  <span className="card-overline">VISUAL LOGO MATCHES</span>
+                  <h3>Similar logos by page or sheet</h3>
+                </div>
+                <span className="evidence-count">
+                  {logoMatches.length} match{logoMatches.length === 1 ? "" : "es"}
+                </span>
+              </div>
+              <p className="logo-matches-note">
+                Showing every image pair scoring at least{" "}
+                {currentResult.logo_match_threshold ?? 80}% similarity, sorted
+                from highest to lowest. Up to 100 matches are shown per page.
+              </p>
+
+              {visibleLogoMatches.length ? (
+                <>
+                  <div className="logo-match-list">
+                    {visibleLogoMatches.map((match, index) => {
+                      const matchNumber =
+                        (logoMatchPage - 1) * LOGO_MATCHES_PER_PAGE + index + 1;
+                      return (
+                        <article className="logo-match-card" key={`${match.reference_image_index}-${match.comparison_image_index}`}>
+                          <span className="logo-match-rank">
+                            #{String(matchNumber).padStart(3, "0")}
+                          </span>
+                          <div className="logo-match-source">
+                            <small>{files[0]?.name || "Reference file"}</small>
+                            <strong>{match.reference_location}</strong>
+                          </div>
+                          <ArrowLeftRight className="logo-match-arrow" size={17} />
+                          <div className="logo-match-source">
+                            <small>{files[1]?.name || "Comparison file"}</small>
+                            <strong>{match.comparison_location}</strong>
+                          </div>
+                          <strong className="logo-match-score">
+                            {match.similarity.toFixed(1)}%
+                          </strong>
+                        </article>
+                      );
+                    })}
+                  </div>
+                  {logoMatchPageCount > 1 && (
+                    <nav className="logo-match-pagination" aria-label="Logo match pages">
+                      <button
+                        type="button"
+                        disabled={logoMatchPage === 1}
+                        onClick={() => setLogoMatchPage((page) => Math.max(1, page - 1))}
+                      >
+                        <ChevronRight className="pagination-previous" size={15} />
+                        Previous
+                      </button>
+                      <span>PAGE {logoMatchPage} OF {logoMatchPageCount}</span>
+                      <button
+                        type="button"
+                        disabled={logoMatchPage === logoMatchPageCount}
+                        onClick={() =>
+                          setLogoMatchPage((page) =>
+                            Math.min(logoMatchPageCount, page + 1),
+                          )
+                        }
+                      >
+                        Next
+                        <ChevronRight size={15} />
+                      </button>
+                    </nav>
+                  )}
+                </>
+              ) : (
+                <div className="evidence-empty logo-matches-empty">
+                  <div className="evidence-empty-icon"><ScanSearch size={24} /></div>
+                  <strong>No logo pairs reached the similarity threshold</strong>
+                  <p>
+                    The files were checked, but no extracted image pairs scored
+                    at least {currentResult.logo_match_threshold ?? 80}%.
+                  </p>
+                </div>
+              )}
             </div>
 
             <div className="results-lower-grid">

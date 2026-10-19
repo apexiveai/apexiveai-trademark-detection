@@ -38,6 +38,17 @@ def make_pdf(document_text: str) -> bytes:
     return output
 
 
+def make_multipage_pdf(page_count: int) -> bytes:
+    document = pymupdf.open()
+    for _ in range(page_count):
+        page = document.new_page(width=512, height=512)
+        page.draw_circle((256, 256), 80, color=None, fill=(0, 0, 0))
+        page.draw_circle((256, 256), 40, color=None, fill=(1, 1, 1))
+    output = document.tobytes()
+    document.close()
+    return output
+
+
 def make_xlsx(document_text: str, logo: bytes) -> bytes:
     workbook = Workbook()
     worksheet = workbook.active
@@ -72,6 +83,73 @@ class VisualExtractionTests(unittest.TestCase):
 
     def test_pdf_vector_page_is_rendered_for_logo_comparison(self) -> None:
         self.assertTrue(self.pdf_images)
+
+    def test_compare_returns_all_similar_pdf_pages(self) -> None:
+        result = asyncio.run(
+            compare_files(
+                file_a=UploadFile(
+                    filename="reference.pdf",
+                    file=io.BytesIO(make_multipage_pdf(2)),
+                ),
+                file_b=UploadFile(
+                    filename="comparison.pdf",
+                    file=io.BytesIO(make_multipage_pdf(1)),
+                ),
+            )
+        )
+
+        matches = result["result"]["logo_matches"]
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(result["result"]["logo_match_threshold"], 80)
+        self.assertNotIn("matches", result["result"]["visual_match"])
+        self.assertEqual(
+            [match["reference_location"] for match in matches],
+            ["Page 1 · rendered page", "Page 2 · rendered page"],
+        )
+        self.assertEqual(
+            matches[0]["comparison_location"],
+            "Page 1 · rendered page",
+        )
+
+    def test_compare_returns_similar_xlsx_logos_with_sheet_names(self) -> None:
+        workbook = Workbook()
+        first_sheet = workbook.active
+        first_sheet.title = "Brand One"
+        first_sheet.add_image(
+            SpreadsheetImage(io.BytesIO(self.logo_png)),
+            "A1",
+        )
+        second_sheet = workbook.create_sheet("Brand Two")
+        second_sheet.add_image(
+            SpreadsheetImage(io.BytesIO(self.logo_png)),
+            "A1",
+        )
+        reference_output = io.BytesIO()
+        workbook.save(reference_output)
+        workbook.close()
+
+        result = asyncio.run(
+            compare_files(
+                file_a=UploadFile(
+                    filename="reference.xlsx",
+                    file=io.BytesIO(reference_output.getvalue()),
+                ),
+                file_b=UploadFile(
+                    filename="comparison.xlsx",
+                    file=io.BytesIO(self.xlsx_reference),
+                ),
+            )
+        )
+
+        matches = result["result"]["logo_matches"]
+        self.assertEqual(len(matches), 2)
+        self.assertEqual(
+            {match["reference_location"] for match in matches},
+            {
+                "Sheet 1 · Brand One · embedded image 1",
+                "Sheet 2 · Brand Two · embedded image 1",
+            },
+        )
 
     def test_svg_is_rasterized_for_visual_comparison(self) -> None:
         svg = (
@@ -232,6 +310,7 @@ class VisualExtractionTests(unittest.TestCase):
 
         self.assertIsNotNone(match)
         self.assertLess(match["similarity"], 80)
+        self.assertEqual(match["matches"], [])
 
 
 if __name__ == "__main__":
