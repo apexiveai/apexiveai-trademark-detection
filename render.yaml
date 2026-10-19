@@ -13,12 +13,16 @@ services:
     envVars:
       - key: AUTH_REQUIRED
         value: "true"
+      - key: COMMUNITY_API_URL
+        value: https://commu-api.apexiveai.com
+      - key: COMMUNITY_SOLUTION_CODE
+        value: trademark-conflict-detector
       - key: TRADEMARK_DATA_DIR
         value: /var/data
       - key: FRONTEND_URL
         sync: false
       - key: CORS_ORIGINS
-        sync: false
+        value: https://apexiveai-detector-v1-1.vercel.app
       - key: JWT_SECRET
         sync: false
       - key: TRADEMARK_INGEST_KEY

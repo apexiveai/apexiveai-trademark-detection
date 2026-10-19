@@ -449,6 +449,7 @@ export default function App() {
   const [searchError, setSearchError] = useState("");
   const [searchResults, setSearchResults] = useState<TrademarkSearchResponse | null>(null);
   const [authRequired, setAuthRequired] = useState(false);
+  const [communityManagedAccess, setCommunityManagedAccess] = useState(false);
   const [authToken, setAuthToken] = useState(() => sessionStorage.getItem("apexive-session") || "");
   const [authEmail, setAuthEmail] = useState("");
   const [authPassword, setAuthPassword] = useState("");
@@ -456,10 +457,6 @@ export default function App() {
   const [authLoading, setAuthLoading] = useState(false);
   const [authMessage, setAuthMessage] = useState("");
 
-  const communityManagedAccess = Boolean(
-    import.meta.env.VITE_COMMUNITY_API_URL &&
-      import.meta.env.VITE_COMMUNITY_SOLUTION_CODE,
-  );
   const canUseWorkspace = !authRequired || Boolean(authToken);
   const canCompare = Boolean(fileA && fileB && !loading && canUseWorkspace);
   const canSearch = Boolean(searchLogo && !searchLoading && canUseWorkspace);
@@ -525,6 +522,7 @@ export default function App() {
       if (response.ok) {
         const status = await response.json();
         setAuthRequired(status.auth_required === true);
+        setCommunityManagedAccess(status.community_access_managed === true);
       }
     } catch {
       setApiOnline(false);
@@ -559,6 +557,23 @@ export default function App() {
         url.searchParams.delete("verify");
         window.history.replaceState({}, "", url);
       });
+  }, []);
+
+  useEffect(() => {
+    const launchUrl = new URL(window.location.href);
+    const launchParams = new URLSearchParams(launchUrl.hash.slice(1));
+    const communityToken = launchParams.get("community_token");
+    if (!communityToken) return;
+
+    launchParams.delete("community_token");
+    launchUrl.hash = launchParams.toString();
+    window.history.replaceState(
+      null,
+      "",
+      `${launchUrl.pathname}${launchUrl.search}${launchUrl.hash}`,
+    );
+    sessionStorage.setItem("apexive-session", communityToken);
+    setAuthToken(communityToken);
   }, []);
 
   const submitAuth = async (event: FormEvent<HTMLFormElement>) => {

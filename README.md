@@ -58,6 +58,13 @@ tenant bearer token. Community tokens are validated against
 access is denied unless the SuperAdmin explicitly grants the tenant. This is the
 recommended deployment mode for subscription-based tenant access.
 
+The Community dashboard passes the tenant token in the launch URL fragment
+(`community_token`), which is not sent in HTTP requests or referrer headers.
+The frontend removes it from the address bar immediately and keeps it only in
+the tab session. The Community-managed access UI reads its status from the
+product API health response. Set `CORS_ORIGINS` on the API to include the
+deployed frontend origin.
+
 ## Importing licensed trademark records
 
 Search results only include records already imported into the vector index.
@@ -134,8 +141,8 @@ backend instances. Use HTTPS in production.
   data disk. The disk/CLIP workload requires a paid plan sized for the model
   and index. Set the listed secret variables in Render.
 - **Vercel UI:** select `frontend` as the project root and set
-  `VITE_API_BASE_URL` to the deployed HTTPS API origin. `frontend/vercel.json`
-  configures the Vite build and SPA fallback.
+  `VITE_API_BASE_URL` to the deployed HTTPS API origin.
+  `frontend/vercel.json` configures the Vite build and SPA fallback.
 - **Railway API:** `backend/Dockerfile` and `backend/railway.toml` are an
   alternative backend configuration. Configure a persistent volume and the
   same production secrets there.
